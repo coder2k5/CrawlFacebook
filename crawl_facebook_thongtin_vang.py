@@ -617,14 +617,14 @@ def insert_comment_photo(comment_id, photo_url):
 
 
 def crawl_page():
-    # legacy entrypoint that performs its own login and navigates to the group
-    # kept for backward compatibility
+    # Use shared login routine from scraper.py (falls back to local method on failure)
     try:
         _login(driver, EMAIL, PASSWORD)
-    except Exception:
-        driver.get("https://www.facebook.com")
-        time.sleep(5)
+    except Exception as e:
+        print(f"Login via scraper._login failed: {e}. Falling back to local login.")
         try:
+            driver.get("https://www.facebook.com")
+            time.sleep(5)
             email_field = driver.find_element(By.ID, "email")
             password_field = driver.find_element(By.ID, "pass")
             email_field.send_keys(EMAIL)
@@ -633,8 +633,8 @@ def crawl_page():
             time.sleep(1)
             password_field.send_keys(Keys.RETURN)
             time.sleep(10)
-        except Exception:
-            pass
+        except Exception as e2:
+            print(f"Fallback login also failed: {e2}")
 
     group_url = "https://www.facebook.com/groups/385914624891314"
     driver.get(group_url)
@@ -969,85 +969,3 @@ def crawl_page():
 
 if __name__ == "__main__":
     crawl_page()
-
-
-def process_loaded_group(driver, max_posts=0):
-    """Process the already-loaded Facebook Group page using existing logic.
-    Returns a list of post dictionaries similar to scraper._extract_html output.
-    If max_posts>0, stops after collecting that many posts.
-    """
-    postBigDict = []
-    index = 0
-    scroll_pause_time = 2
-
-    while True:
-        post_elements = driver.find_elements(By.XPATH, '//*[contains(@role, "article")]')
-        # fallback to common class if xpath didn't work
-        if not post_elements:
-            try:
-                post_elements = driver.find_elements(By.XPATH, "//div[contains(@class,'x1yztbdb')]")
-            except Exception:
-                post_elements = []
-
-        print(f"Total posts found: {len(post_elements)}")
-        if index >= len(post_elements):
-            break
-
-        post_element = post_elements[index]
-        driver.execute_script("arguments[0].scrollIntoView();", post_element)
-        time.sleep(scroll_pause_time)
-
-        try:
-            post = BeautifulSoup(post_element.get_attribute("outerHTML"), "html.parser")
-            # extract content similar to existing logic
-            content_text = ""
-            username_text = "anonymous"
-
-            username = post.find("span", class_=re.compile(r"xdj266r|x1mh8g0r"))
-            if username:
-                username_text = username.text.strip()
-
-            content_wrapper = post.find(attrs={"data-ad-rendering-role": "story_message"})
-            if content_wrapper:
-                content_text = content_wrapper.get_text(separator=' ', strip=True)
-            else:
-                # try dir auto blocks
-                candidates = [t.get_text(separator=' ', strip=True) for t in post.find_all(['div','span','p'], attrs={'dir':'auto'})]
-                if candidates:
-                    content_text = max(candidates, key=len)
-                else:
-                    content_text = post.get_text(separator=' ', strip=True)
-
-            image_links = []
-            for img in post.find_all('img', src=True):
-                src = img.get('src')
-                if src:
-                    image_links.append(src)
-
-            # prepare post dict
-            postDict = dict()
-            postDict['Post'] = content_text
-            postDict['Link'] = _extract_link(post) if ' _extract_link' in globals() else ''
-            postDict['PostId'] = _extract_post_id(post) if ' _extract_post_id' in globals() else postDict['Link']
-            postDict['Image'] = image_links[0] if image_links else ''
-            postDict['Shares'] = ''
-            postDict['Comments'] = {}
-
-            # append and optionally perform DB inserts as original flow
-            postBigDict.append(postDict)
-
-            # stop if reached max_posts
-            if max_posts and len(postBigDict) >= max_posts:
-                break
-
-        except Exception as e:
-            print(f"Error processing post element: {e}")
-
-        index += 1
-
-        # ensure we scroll to load more
-        if index >= len(post_elements)-3:
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(4)
-
-    return postBigDict
