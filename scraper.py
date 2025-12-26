@@ -2,9 +2,14 @@ import argparse
 import time
 import json
 import csv
+import math
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup as bs
 
 
@@ -14,6 +19,7 @@ with open('facebook_credentials.txt') as file:
 
 
 def _extract_post_text(item):
+    # Try old selector first
     actualPosts = item.find_all(attrs={"data-testid": "post_message"})
     text = ""
     if actualPosts:
@@ -22,31 +28,69 @@ def _extract_post_text(item):
             text = ""
             for index in range(0, len(paragraphs)):
                 text += paragraphs[index].text
-    return text
+        if text:
+            return text
+
+    # Fallback: find visible text blocks used in group posts (dir="auto")
+    candidates = []
+    for tag in item.find_all(['div', 'span', 'p'], attrs={'dir': 'auto'}):
+        t = tag.get_text(separator=' ', strip=True)
+        if t and len(t) > 0:
+            candidates.append(t)
+
+    if candidates:
+        # choose the longest candidate as most likely the post body
+        return max(candidates, key=len)
+
+    # Last resort: return all text inside the item
+    return item.get_text(separator=' ', strip=True)
 
 
 def _extract_link(item):
-    postLinks = item.find_all(class_="_6ks")
-    link = ""
-    for postLink in postLinks:
-        link = postLink.find('a').get('href')
-    return link
+    # Try to find a permalink or post link within the post item
+    anchors = item.find_all('a', href=True)
+    for a in anchors:
+        href = a.get('href')
+        if href and ("/permalink" in href or "/posts/" in href or "/groups/" in href):
+            if href.startswith('http'):
+                return href
+            return f"https://www.facebook.com{href}"
+
+    # fallback: first anchor
+    if anchors:
+        href = anchors[0].get('href')
+        if href:
+            return href if href.startswith('http') else f"https://www.facebook.com{href}"
+    return ""
 
 
 def _extract_post_id(item):
-    postIds = item.find_all(class_="_5pcq")
-    post_id = ""
-    for postId in postIds:
-        post_id = f"https://www.facebook.com{postId.get('href')}"
-    return post_id
+    # Look for permalink-style hrefs to build a stable post URL
+    anchors = item.find_all('a', href=True)
+    for a in anchors:
+        href = a.get('href')
+        if href and ("/permalink" in href or "/posts/" in href):
+            return href if href.startswith('http') else f"https://www.facebook.com{href}"
+
+    # fallback to link extractor
+    return _extract_link(item)
 
 
 def _extract_image(item):
-    postPictures = item.find_all(class_="scaledImageFitWidth img")
-    image = ""
-    for postPicture in postPictures:
-        image = postPicture.get('src')
-    return image
+    # Find first meaningful image inside the post (scontent or static)
+    for img in item.find_all('img', src=True):
+        src = img.get('src')
+        if not src:
+            continue
+        # prefer content images
+        if 'scontent' in src or 'cdn' in src or 'static' in src:
+            return src
+
+    # fallback: any img
+    img = item.find('img', src=True)
+    if img:
+        return img.get('src')
+    return ""
 
 
 def _extract_shares(item):
@@ -64,7 +108,7 @@ def _extract_shares(item):
 
 
 def _extract_comments(item):
-    postComments = item.findAll("div", {"class": "_4eek"})
+    postComments = item.find_all("div", {"class": "_4eek"})
     comments = dict()
     # print(postDict)
     for comment in postComments:
@@ -166,29 +210,49 @@ def _extract_reaction(item):
     return reaction
 
 
-def _extract_html(bs_data):
+def _extract_html(bs_data, is_group=False):
 
     #Add to check
     with open('./bs.html',"w", encoding="utf-8") as file:
         file.write(str(bs_data.prettify()))
 
-    k = bs_data.find_all(class_="_5pcr userContentWrapper")
+    # Tìm posts khác nhau cho Pages vs Groups
+    if is_group:
+        # Facebook Groups sử dụng div với role="article"
+        posts = bs_data.find_all('div', {'role': 'article'})
+        if not posts:
+            # Fallback nếu không tìm thấy
+            posts = bs_data.find_all(class_="x1yztbdb")
+    else:
+        # Facebook Pages sử dụng div với class "_5pcr userContentWrapper"
+        posts = bs_data.find_all(class_="_5pcr userContentWrapper")
+        if not posts:
+            # Fallback cho HTML mới
+            posts = bs_data.find_all('div', {'role': 'article'})
+
     postBigDict = list()
 
-    for item in k:
-        postDict = dict()
-        postDict['Post'] = _extract_post_text(item)
-        postDict['Link'] = _extract_link(item)
-        postDict['PostId'] = _extract_post_id(item)
-        postDict['Image'] = _extract_image(item)
-        postDict['Shares'] = _extract_shares(item)
-        postDict['Comments'] = _extract_comments(item)
-        # postDict['Reaction'] = _extract_reaction(item)
+    for item in posts:
+        try:
+            postDict = dict()
+            postDict['Post'] = _extract_post_text(item)
+            postDict['Link'] = _extract_link(item) or _extract_post_id(item)
+            postDict['PostId'] = _extract_post_id(item)
+            postDict['Image'] = _extract_image(item)
+            postDict['Shares'] = _extract_shares(item)
+            postDict['Comments'] = _extract_comments(item) if _extract_comments(item) else {}
 
-        #Add to check
-        postBigDict.append(postDict)
-        with open('./postBigDict.json','w', encoding='utf-8') as file:
-            file.write(json.dumps(postBigDict, ensure_ascii=False).encode('utf-8').decode())
+            # Bỏ qua posts không có nội dung
+            if not postDict['Post'] and not postDict['Image']:
+                continue
+
+            #Add to check
+            postBigDict.append(postDict)
+            with open('./postBigDict.json','w', encoding='utf-8') as file:
+                file.write(json.dumps(postBigDict, ensure_ascii=False).encode('utf-8').decode())
+        except Exception as e:
+            print(f"Error extracting post: {e}")
+            continue
 
     return postBigDict
 
@@ -196,20 +260,42 @@ def _extract_html(bs_data):
 def _login(browser, email, password):
     browser.get("http://facebook.com")
     browser.maximize_window()
-    browser.find_element_by_name("email").send_keys(email)
-    browser.find_element_by_name("pass").send_keys(password)
-    browser.find_element_by_id('loginbutton').click()
+    time.sleep(3)
+    
+    # Wait for email field to be present
+    wait = WebDriverWait(browser, 15)
+    email_field = wait.until(EC.presence_of_element_located((By.NAME, "email")))
+    email_field.send_keys(email)
+    
+    # Wait for password field and fill it
+    password_field = wait.until(EC.presence_of_element_located((By.NAME, "pass")))
+    password_field.send_keys(password)
+    
+    # Wait for login button - try different selectors
+    try:
+        # Try ID first (older Facebook version)
+        login_button = wait.until(EC.element_to_be_clickable((By.ID, 'loginbutton')))
+    except:
+        # Try button with type='submit'
+        try:
+            login_button = wait.until(EC.element_to_be_clickable((By.XPATH, '//button[@name="login"]')))
+        except:
+            # Try any submit button
+            login_button = wait.until(EC.element_to_be_clickable((By.XPATH, '//button[@type="submit"]')))
+    
+    login_button.click()
     time.sleep(5)
 
 
-def _count_needed_scrolls(browser, infinite_scroll, numOfPost):
+def _count_needed_scrolls(browser, infinite_scroll, numOfPost, is_group=False):
     if infinite_scroll:
         lenOfPage = browser.execute_script(
             "window.scrollTo(0, document.body.scrollHeight);var lenOfPage=document.body.scrollHeight;return lenOfPage;"
         )
     else:
-        # roughly 8 post per scroll kindaOf
-        lenOfPage = int(numOfPost / 8)
+        # roughly posts per scroll: groups tend to load fewer posts per scroll
+        posts_per_scroll = 4 if is_group else 8
+        lenOfPage = max(1, math.ceil(numOfPost / posts_per_scroll))
     print("Number Of Scrolls Needed " + str(lenOfPage))
     return lenOfPage
 
@@ -226,7 +312,8 @@ def _scroll(browser, infinite_scroll, lenOfPage):
 
         # wait for the browser to load, this time can be changed slightly ~3 seconds with no difference, but 5 seems
         # to be stable enough
-        time.sleep(5)
+        # wait a bit longer to allow XHR-rendered content to appear
+        time.sleep(6)
 
         if infinite_scroll:
             lenOfPage = browser.execute_script(
@@ -252,11 +339,17 @@ def extract(page, numOfPost, infinite_scroll=False, scrape_comment=False):
         "profile.default_content_setting_values.notifications": 1
     })
 
+    # Kiểm tra xem có phải Facebook Group không
+    is_group = "/groups/" in page
+
     # chromedriver should be in the same folder as file
-    browser = webdriver.Chrome(executable_path="./chromedriver", options=option)
+    service = Service("./chromedriver")
+    browser = webdriver.Chrome(service=service, options=option)
+    browser.set_page_load_timeout(180)  # Tăng timeout lên 180 giây (3 phút)
     _login(browser, EMAIL, PASSWORD)
     browser.get(page)
-    lenOfPage = _count_needed_scrolls(browser, infinite_scroll, numOfPost)
+    time.sleep(5)  # Chờ trang load xong
+    lenOfPage = _count_needed_scrolls(browser, infinite_scroll, numOfPost, is_group=is_group)
     _scroll(browser, infinite_scroll, lenOfPage)
 
     # click on all the comments to scrape them all!
@@ -266,7 +359,7 @@ def extract(page, numOfPost, infinite_scroll=False, scrape_comment=False):
     if scrape_comment:
         #first uncollapse collapsed comments
         unCollapseCommentsButtonsXPath = '//a[contains(@class,"_666h")]'
-        unCollapseCommentsButtons = browser.find_elements_by_xpath(unCollapseCommentsButtonsXPath)
+        unCollapseCommentsButtons = browser.find_elements(By.XPATH, unCollapseCommentsButtonsXPath)
         for unCollapseComment in unCollapseCommentsButtons:
             action = webdriver.common.action_chains.ActionChains(browser)
             try:
@@ -279,7 +372,7 @@ def extract(page, numOfPost, infinite_scroll=False, scrape_comment=False):
                 pass
 
         #second set comment ranking to show all comments
-        rankDropdowns = browser.find_elements_by_class_name('_2pln') #select boxes who have rank dropdowns
+        rankDropdowns = browser.find_elements(By.CLASS_NAME, '_2pln') #select boxes who have rank dropdowns
         rankXPath = '//div[contains(concat(" ", @class, " "), "uiContextualLayerPositioner") and not(contains(concat(" ", @class, " "), "hidden_elem"))]//div/ul/li/a[@class="_54nc"]/span/span/div[@data-ordering="RANKED_UNFILTERED"]'
         for rankDropdown in rankDropdowns:
             #click to open the filter modal
@@ -292,14 +385,14 @@ def extract(page, numOfPost, infinite_scroll=False, scrape_comment=False):
                 pass
 
             # if modal is opened filter comments
-            ranked_unfiltered = browser.find_elements_by_xpath(rankXPath) # RANKED_UNFILTERED => (All Comments)
+            ranked_unfiltered = browser.find_elements(By.XPATH, rankXPath) # RANKED_UNFILTERED => (All Comments)
             if len(ranked_unfiltered) > 0:
                 try:
                     ranked_unfiltered[0].click()
                 except:
                     pass    
         
-        moreComments = browser.find_elements_by_xpath('//a[@class="_4sxc _42ft"]')
+        moreComments = browser.find_elements(By.XPATH, '//a[@class="_4sxc _42ft"]')
         print("Scrolling through to click on more comments")
         while len(moreComments) != 0:
             for moreComment in moreComments:
@@ -313,7 +406,7 @@ def extract(page, numOfPost, infinite_scroll=False, scrape_comment=False):
                     # do nothing right here
                     pass
 
-            moreComments = browser.find_elements_by_xpath('//a[@class="_4sxc _42ft"]')
+            moreComments = browser.find_elements(By.XPATH, '//a[@class="_4sxc _42ft"]')
 
     # Now that the page is fully scrolled, grab the source code.
     source_data = browser.page_source
@@ -321,7 +414,7 @@ def extract(page, numOfPost, infinite_scroll=False, scrape_comment=False):
     # Throw your source into BeautifulSoup and start parsing!
     bs_data = bs(source_data, 'html.parser')
 
-    postBigDict = _extract_html(bs_data)
+    postBigDict = _extract_html(bs_data, is_group=is_group)
     browser.close()
 
     return postBigDict
