@@ -3,6 +3,8 @@ import time
 import json
 import csv
 import math
+import re
+from datetime import datetime
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -16,6 +18,56 @@ from bs4 import BeautifulSoup as bs
 with open('facebook_credentials.txt') as file:
     EMAIL = file.readline().split('"')[1]
     PASSWORD = file.readline().split('"')[1]
+
+
+# Import extraction functions from crawl_facebook_thongtin_vang.py
+try:
+    from crawl_facebook_thongtin_vang import (
+        _extract_post_text,
+        _extract_link,
+        _extract_post_id,
+        _extract_image
+    )
+except ImportError:
+    # Fallback: define locally if crawl_facebook_thongtin_vang is not available
+    def _extract_post_text(item):
+        actualPosts = item.find_all(attrs={"data-testid": "post_message"})
+        if actualPosts:
+            for posts in actualPosts:
+                paragraphs = posts.find_all('p')
+                text = ""
+                for p in paragraphs:
+                    text += p.text
+            if text:
+                return text
+        candidates = [t.get_text(separator=' ', strip=True) for t in item.find_all(['div','span','p'], attrs={'dir':'auto'}) if t.get_text(separator=' ', strip=True)]
+        return max(candidates, key=len) if candidates else item.get_text(separator=' ', strip=True)
+
+    def _extract_link(item):
+        for a in item.find_all('a', href=True):
+            href = a.get('href')
+            if href and any(x in href for x in ["/permalink", "/posts/", "/groups/"]):
+                return href if href.startswith('http') else f"https://www.facebook.com{href}"
+        anchors = item.find_all('a', href=True)
+        if anchors:
+            href = anchors[0].get('href')
+            return href if href and href.startswith('http') else (f"https://www.facebook.com{href}" if href else "")
+        return ""
+
+    def _extract_post_id(item):
+        for a in item.find_all('a', href=True):
+            href = a.get('href')
+            if href and any(x in href for x in ["/permalink", "/posts/"]):
+                return href if href.startswith('http') else f"https://www.facebook.com{href}"
+        return _extract_link(item)
+
+    def _extract_image(item):
+        for img in item.find_all('img', src=True):
+            src = img.get('src')
+            if src and any(x in src for x in ['scontent','cdn','static']):
+                return src
+        img = item.find('img', src=True)
+        return img.get('src') if img else ""
 
 
 def _extract_post_text(item):
@@ -414,7 +466,13 @@ def extract(page, numOfPost, infinite_scroll=False, scrape_comment=False):
     # Throw your source into BeautifulSoup and start parsing!
     bs_data = bs(source_data, 'html.parser')
 
-    postBigDict = _extract_html(bs_data, is_group=is_group)
+    # Prefer using the processing logic from crawl_facebook_thongtin_vang if available
+    try:
+        from crawl_facebook_thongtin_vang import process_loaded_group
+        # ensure the page is loaded and then call the processor which uses Selenium driver
+        postBigDict = process_loaded_group(browser, max_posts=numOfPost)
+    except Exception:
+        postBigDict = _extract_html(bs_data, is_group=is_group)
     browser.close()
 
     return postBigDict
