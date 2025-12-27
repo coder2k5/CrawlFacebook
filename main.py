@@ -1,55 +1,82 @@
-from scraper import extract
+# main.py
 import argparse
-import json
 import csv
+import json
+import config
+import crawler
+import extractor
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Facebook Page Scraper")
-    required_parser = parser.add_argument_group("required arguments")
-    required_parser.add_argument('-page', '-p', help="The Facebook Public Page you want to scrape", required=True)
-    required_parser.add_argument('-len', '-l', help="Number of Posts you want to scrape", type=int, required=True)
-    optional_parser = parser.add_argument_group("optional arguments")
-    optional_parser.add_argument('-infinite', '-i',
-                                 help="Scroll until the end of the page (1 = infinite) (Default is 0)", type=int,
-                                 default=0)
-    optional_parser.add_argument('-usage', '-u', help="What to do with the data: "
-                                                      "Print on Screen (PS), "
-                                                      "Write to Text File (WT) (Default is WT)", default="CSV")
+def save_to_txt(data, filename='output.txt'):
+    with open(filename, 'w', encoding='utf-8') as file:
+        for post in data:
+            file.write(json.dumps(post, ensure_ascii=False) + "\n")
 
-    optional_parser.add_argument('-comments', '-c', help="Scrape ALL Comments of Posts (y/n) (Default is n). When "
-                                                         "enabled for pages where there are a lot of comments it can "
-                                                         "take a while", default="No")
+def save_to_csv(data, filename='data.csv'):
+    with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['Post', 'Link', 'Image', 'Comments', 'Shares'])
+        for post in data:
+            # Xử lý an toàn nếu key không tồn tại
+            writer.writerow([
+                post.get('Post', ''), 
+                post.get('Link', ''), 
+                post.get('Image', ''), 
+                str(post.get('Comments', '')), 
+                post.get('Shares', '')
+            ])
+
+def main():
+    parser = argparse.ArgumentParser(description="Facebook Page Scraper Refactored")
+    req_group = parser.add_argument_group("required arguments")
+    req_group.add_argument('-page', '-p', help="The Facebook Public Page URL", required=True)
+    req_group.add_argument('-len', '-l', help="Number of Posts to scrape", type=int, required=True)
+    
+    opt_group = parser.add_argument_group("optional arguments")
+    opt_group.add_argument('-infinite', '-i', type=int, default=0, help="1 = infinite scroll")
+    opt_group.add_argument('-usage', '-u', default="CSV", help="Output format: CSV, WT (text), or PS (print)")
+    opt_group.add_argument('-comments', '-c', default="No", help="Scrape comments (y/n)")
+    
     args = parser.parse_args()
 
-    infinite = False
-    if args.infinite == 1:
-        infinite = True
+    # 1. Load Credentials
+    email, password = config.load_credentials()
 
-    scrape_comment = False
-    if args.comments == 'y':
-        scrape_comment = True
+    # 2. Config Flags
+    infinite = (args.infinite == 1)
+    scrape_comment = (args.comments == 'y')
 
-    postBigDict = extract(page=args.page, numOfPost=args.len, infinite_scroll=infinite, scrape_comment=scrape_comment)
+    # 3. Run Crawler
+    print("Starting crawler...")
+    html_source, is_group = crawler.crawl_content(
+        page_url=args.page,
+        num_of_post=args.len,
+        email=email,
+        password=password,
+        infinite_scroll=infinite,
+        scrape_comment=scrape_comment
+    )
 
+    if not html_source:
+        print("Failed to retrieve HTML source.")
+        return
 
-    #TODO: rewrite parser
+    # 4. Parse Data
+    print("Parsing data...")
+    data = extractor.parse_html_content(html_source, is_group=is_group)
+    print(f"Extracted {len(data)} posts.")
+
+    # 5. Save Output
     if args.usage == "WT":
-        with open('output.txt', 'w') as file:
-            for post in postBigDict:
-                file.write(json.dumps(post))  # use json load to recover
-
+        save_to_txt(data)
+        print("Saved to output.txt")
     elif args.usage == "CSV":
-        with open('data.csv', 'w',) as csvfile:
-           writer = csv.writer(csvfile)
-           #writer.writerow(['Post', 'Link', 'Image', 'Comments', 'Reaction'])
-           writer.writerow(['Post', 'Link', 'Image', 'Comments', 'Shares'])
-
-           for post in postBigDict:
-              writer.writerow([post['Post'], post['Link'],post['Image'], post['Comments'], post['Shares']])
-              #writer.writerow([post['Post'], post['Link'],post['Image'], post['Comments'], post['Reaction']])
-
+        save_to_csv(data)
+        print("Saved to data.csv")
     else:
-        for post in postBigDict:
+        for post in data:
             print(post)
 
-    print("Finished")
+    print("Finished.")
+
+if __name__ == "__main__":
+    main()
