@@ -1,257 +1,352 @@
-import argparse
-import time
+import mysql.connector
+import bcrypt
+import requests
+import unicodedata
+from datetime import datetime
+from bs4 import BeautifulSoup
+import re
 import json
-import csv
-import math
+import os
+import time
+import random
+import hashlib
+from urllib.parse import urlparse
+from PIL import Image
+import uuid
+import traceback
 
+# Selenium Imports
 from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support.wait import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from bs4 import BeautifulSoup as bs
+from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
 
-
-with open('facebook_credentials.txt') as file:
-    EMAIL = file.readline().split('"')[1]
-    PASSWORD = file.readline().split('"')[1]
-
-
-def _extract_post_text(item):
-    # Try old selector first
-    actualPosts = item.find_all(attrs={"data-testid": "post_message"})
-    text = ""
-    if actualPosts:
-        for posts in actualPosts:
-            paragraphs = posts.find_all('p')
-            text = ""
-            for index in range(0, len(paragraphs)):
-                text += paragraphs[index].text
-        if text:
-            return text
-
-    # Fallback: find visible text blocks used in group posts (dir="auto")
-    candidates = []
-    for tag in item.find_all(['div', 'span', 'p'], attrs={'dir': 'auto'}):
-        t = tag.get_text(separator=' ', strip=True)
-        if t and len(t) > 0:
-            candidates.append(t)
-
-    if candidates:
-        # choose the longest candidate as most likely the post body
-        return max(candidates, key=len)
-
-    # Last resort: return all text inside the item
-    return item.get_text(separator=' ', strip=True)
-
-
-def _extract_link(item):
-    # Try to find a permalink or post link within the post item
-    anchors = item.find_all('a', href=True)
-    for a in anchors:
-        href = a.get('href')
-        if href and ("/permalink" in href or "/posts/" in href or "/groups/" in href):
-            if href.startswith('http'):
-                return href
-            return f"https://www.facebook.com{href}"
-
-    # fallback: first anchor
-    if anchors:
-        href = anchors[0].get('href')
-        if href:
-            return href if href.startswith('http') else f"https://www.facebook.com{href}"
-    return ""
-
-def _extract_post_id(item):
-    # Look for permalink-style hrefs to build a stable post URL
-    anchors = item.find_all('a', href=True)
-    for a in anchors:
-        href = a.get('href')
-        if href and ("/permalink" in href or "/posts/" in href):
-            return href if href.startswith('http') else f"https://www.facebook.com{href}"
-
-    # fallback to link extractor
-    return _extract_link(item)
-
-def _extract_image(item):
-    # Find first meaningful image inside the post (scontent or static)
-    for img in item.find_all('img', src=True):
-        src = img.get('src')
-        if not src:
-            continue
-        # prefer content images
-        if 'scontent' in src or 'cdn' in src or 'static' in src:
-            return src
-
-    # fallback: any img
-    img = item.find('img', src=True)
-    if img:
-        return img.get('src')
-    return ""
-
-def _extract_shares(item):
-    postShares = item.find_all(class_="_4vn1")
-    shares = ""
-    for postShare in postShares:
-
-        x = postShare.string
-        if x is not None:
-            x = x.split(">", 1)
-            shares = x
-        else:
-            shares = "0"
-    return shares
-
-def _extract_comments(item):
-    postComments = item.find_all("div", {"class": "_4eek"})
-    comments = dict()
-    # print(postDict)
-    for comment in postComments:
-        if comment.find(class_="_6qw4") is None:
-            continue
-
-        commenter = comment.find(class_="_6qw4").text
-        comments[commenter] = dict()
-
-        comment_text = comment.find("span", class_="_3l3x")
-
-        if comment_text is not None:
-            comments[commenter]["text"] = comment_text.text
-
-        comment_link = comment.find(class_="_ns_")
-        if comment_link is not None:
-            comments[commenter]["link"] = comment_link.get("href")
-
-        comment_pic = comment.find(class_="_2txe")
-        if comment_pic is not None:
-            comments[commenter]["image"] = comment_pic.find(class_="img").get("src")
-
-        commentList = item.find('ul', {'class': '_7791'})
-        if commentList:
-            comments = dict()
-            comment = commentList.find_all('li')
-            if comment:
-                for litag in comment:
-                    aria = litag.find("div", {"class": "_4eek"})
-                    if aria:
-                        commenter = aria.find(class_="_6qw4").text
-                        comments[commenter] = dict()
-                        comment_text = litag.find("span", class_="_3l3x")
-                        if comment_text:
-                            comments[commenter]["text"] = comment_text.text
-                            # print(str(litag)+"\n")
-
-                        comment_link = litag.find(class_="_ns_")
-                        if comment_link is not None:
-                            comments[commenter]["link"] = comment_link.get("href")
-
-                        comment_pic = litag.find(class_="_2txe")
-                        if comment_pic is not None:
-                            comments[commenter]["image"] = comment_pic.find(class_="img").get("src")
-
-                        repliesList = litag.find(class_="_2h2j")
-                        if repliesList:
-                            reply = repliesList.find_all('li')
-                            if reply:
-                                comments[commenter]['reply'] = dict()
-                                for litag2 in reply:
-                                    aria2 = litag2.find("div", {"class": "_4efk"})
-                                    if aria2:
-                                        replier = aria2.find(class_="_6qw4").text
-                                        if replier:
-                                            comments[commenter]['reply'][replier] = dict()
-
-                                            reply_text = litag2.find("span", class_="_3l3x")
-                                            if reply_text:
-                                                comments[commenter]['reply'][replier][
-                                                    "reply_text"] = reply_text.text
-
-                                            r_link = litag2.find(class_="_ns_")
-                                            if r_link is not None:
-                                                comments[commenter]['reply']["link"] = r_link.get("href")
-
-                                            r_pic = litag2.find(class_="_2txe")
-                                            if r_pic is not None:
-                                                comments[commenter]['reply']["image"] = r_pic.find(
-                                                    class_="img").get("src")
-    return comments
-
-def _extract_reaction(item):
-    toolBar = item.find_all(attrs={"role": "toolbar"})
-
-    if not toolBar:  # pretty fun
-        return
-    reaction = dict()
-    for toolBar_child in toolBar[0].children:
-        str = toolBar_child['data-testid']
-        reaction = str.split("UFI2TopReactions/tooltip_")[1]
-
-        reaction[reaction] = 0
-
-        for toolBar_child_child in toolBar_child.children:
-
-            num = toolBar_child_child['aria-label'].split()[0]
-
-            # fix weird ',' happening in some reaction values
-            num = num.replace(',', '.')
-
-            if 'K' in num:
-                realNum = float(num[:-1]) * 1000
+# ==========================================
+# 1. CONFIGURATION & CREDENTIALS
+# ==========================================
+EMAIL = ""
+PASSWORD = ""
+try:
+    with open('facebook_credentials.txt', 'r') as file:
+        lines = file.readlines()
+        if len(lines) >= 2:
+            line1 = lines[0].strip()
+            line2 = lines[1].strip()
+            if '"' in line1:
+                EMAIL = line1.split('"')[1]
+                PASSWORD = line2.split('"')[1]
             else:
-                realNum = float(num)
+                EMAIL = line1
+                PASSWORD = line2
+except FileNotFoundError:
+    print("Warning: 'facebook_credentials.txt' not found.")
 
-            reaction[reaction] = realNum
-    return reaction
+image_folder = r"/var/www/thinkdiff-web/vang247_xyz/image_tintuc/"
+if not os.path.exists(image_folder):
+    os.makedirs(image_folder)
 
-def _extract_html(bs_data, is_group=False):
+seen_posts = set()
 
-    #Add to check
-    with open('./bs.html',"w", encoding="utf-8") as file:
-        file.write(str(bs_data.prettify()))
+# ==========================================
+# 2. DATABASE FUNCTIONS (GIỮ NGUYÊN)
+# ==========================================
+def connect_to_database():
+    return mysql.connector.connect(
+        host="localhost",      
+        user='phpmyadmin',
+        password='Sonhehe89!',
+        database='gold_silver', 
+    )
 
-    # Tìm posts khác nhau cho Pages vs Groups
-    if is_group:
-        # Facebook Groups sử dụng div với role="article"
-        posts = bs_data.find_all('div', {'role': 'article'})
-        if not posts:
-            # Fallback nếu không tìm thấy
-            posts = bs_data.find_all(class_="x1yztbdb")
-    else:
-        # Facebook Pages sử dụng div với class "_5pcr userContentWrapper"
-        posts = bs_data.find_all(class_="_5pcr userContentWrapper")
-        if not posts:
-            # Fallback cho HTML mới
-            posts = bs_data.find_all('div', {'role': 'article'})
+def xoa_dau(txt: str) -> str:
+    if not txt: return ""
+    BANG_XOA_DAU = str.maketrans(
+        "ÁÀẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬĐÈÉẺẼẸÊẾỀỂỄỆÍÌỈĨỊÓÒỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÚÙỦŨỤƯỨỪỬỮỰÝỲỶỸỴáàảãạăắằẳẵặâấầẩẫậđèéẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵ",
+        "A"*17 + "D" + "E"*11 + "I"*5 + "O"*17 + "U"*11 + "Y"*5 + "a"*17 + "d" + "e"*11 + "i"*5 + "o"*17 + "u"*11 + "y"*5
+    )
+    if not unicodedata.is_normalized("NFC", txt):
+        txt = unicodedata.normalize("NFC", txt)
+    return txt.translate(BANG_XOA_DAU)
 
-    postBigDict = list()
+def get_provinces_id_from_title(title_text):
+    if not title_text: return None
+    provinces_mapping = {
+        'An Giang': 1, 'Bà Rịa - Vũng Tàu': 2, 'Bạc Liêu': 3, 'Bắc Kạn': 4, 'Bắc Giang': 5,
+        'Bắc Ninh': 6, 'Bến Tre': 7, 'Bình Dương': 8, 'Bình Định': 9, 'Bình Phước': 10,
+        'Bình Thuận': 11, 'Cà Mau': 12, 'Cao Bằng': 13, 'Cần Thơ': 14, 'Đà Nẵng': 15,
+        'Đắk Lắk': 16, 'Đắk Nông': 17, 'Điện Biên': 18, 'Đồng Nai': 19, 'Đồng Tháp': 20,
+        'Gia Lai': 21, 'Hà Giang': 22, 'Hà Nam': 23, 'Hà Nội': 24, 'Hà Tĩnh': 25,
+        'Hải Dương': 26, 'Hải Phòng': 27, 'Hòa Bình': 28, 'Hồ Chí Minh': 29, 'HCM': 29,
+        'Hậu Giang': 30, 'Hưng Yên': 31, 'Khánh Hòa': 32, 'Kiên Giang': 33, 'Kon Tum': 34,
+        'Lai Châu': 35, 'Lào Cai': 36, 'Lạng Sơn': 37, 'Lâm Đồng': 38, 'Long An': 39,
+        'Nam Định': 40, 'Nghệ An': 41, 'Ninh Bình': 42, 'Ninh Thuận': 43, 'Phú Thọ': 44,
+        'Phú Yên': 45, 'Quảng Bình': 46, 'Quảng Nam': 47, 'Quảng Ngãi': 48, 'Quảng Ninh': 49,
+        'Quảng Trị': 50, 'Sóc Trăng': 51, 'Sơn La': 52, 'Tây Ninh': 53, 'Thái Bình': 54,
+        'Thái Nguyên': 55, 'Thanh Hóa': 56, 'Thừa Thiên Huế': 57, 'Tiền Giang': 58,
+        'Trà Vinh': 59, 'Tuyên Quang': 60, 'Vĩnh Long': 61, 'Vĩnh Phúc': 62, 'Yên Bái': 63
+    }
+    title_text_lower = title_text.lower()
+    for province_name, provinces_id in provinces_mapping.items():
+        if province_name.lower() in title_text_lower:
+            return provinces_id
+    return None
 
-    for item in posts:
+def get_district_id_from_title(title_text):
+    if not title_text: return None
+    try:
+        connection = connect_to_database()
+        cursor = connection.cursor()
+        cursor.execute("SELECT DistrictID FROM Districts WHERE LOWER(DistrictName) LIKE LOWER(%s)", ('%' + title_text + '%',))
+        result = cursor.fetchone()
+        connection.close()
+        if result: return result[0]
+    except: pass
+    return None
+
+def insert_user_to_db(username):
+    if not username or username == "Unknown User": return
+    cleaned_username = re.sub(r'\W+', '', username)
+    cleaned_username = xoa_dau(cleaned_username)
+    password_hashed = bcrypt.hashpw("123456".encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    email = f"{cleaned_username}@gmail.com"
+    try:
+        connection = connect_to_database()
+        cursor = connection.cursor()
+        check_query = "SELECT COUNT(*) FROM Users WHERE Username = %s"
+        cursor.execute(check_query, (username,))
+        user_exists = cursor.fetchone()[0] > 0
+        if not user_exists:
+            insert_query = """
+                INSERT INTO Users (Fullname, Username, Password, Email, Role, coin, Confirmed, Blocked, IsAnonymous)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(insert_query, ("", username, password_hashed, email, 0, 0, 0, 0, 0))
+            connection.commit()
+    except: pass
+    finally:
+        if 'connection' in locals() and connection.is_connected():
+            cursor.close()
+            connection.close()
+
+def get_user_id(username):
+    try:
+        connection = connect_to_database()
+        cursor = connection.cursor()
+        cursor.execute("SELECT UserID FROM Users WHERE Username = %s", (username,))
+        result = cursor.fetchone()
+        connection.close()
+        return result[0] if result else None
+    except: return None
+
+def insert_into_forumposts(user_id, group_id, title, content, post_time, ip_posted, post_latitude, post_longitude, time_view, district_id, provinces_id):
+    try:
+        connection = connect_to_database()
+        cursor = connection.cursor()
+        cursor.execute("SELECT PostID FROM ForumPosts WHERE Content = %s LIMIT 1", (content,))
+        existing_post = cursor.fetchone()
+        if existing_post:
+            connection.close()
+            return existing_post[0]
+
+        insert_query = """
+            INSERT INTO ForumPosts (UserID, GroupID, Title, Content, PostTime, IPPosted, PostLatitude, PostLongitude, UpdatePostAt, timeView, district_id, provinces_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s, %s)
+        """
+        values = (user_id, group_id, title, content, post_time, ip_posted, post_latitude, post_longitude, time_view, district_id, provinces_id)
+        cursor.execute(insert_query, values)
+        connection.commit()
+        post_id = cursor.lastrowid
+        connection.close()
+        return post_id
+    except Exception as e:
+        print(f"Error insert post: {e}")
+        return None
+
+def insert_into_forumphotos(post_id, photo_url, upload_time):
+    try:
+        connection = connect_to_database()
+        cursor = connection.cursor()
+        cursor.execute("SELECT COUNT(*) FROM ForumPhotos WHERE PhotoURL = %s", (photo_url,))
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("INSERT INTO ForumPhotos (PostID, PhotoURL, uploadTime) VALUES (%s, %s, %s)", (post_id, photo_url, upload_time))
+            connection.commit()
+        connection.close()
+    except: pass
+
+def insert_comment(post_id, user_id, content):
+    try:
+        connection = connect_to_database()
+        cursor = connection.cursor()
+        cursor.execute("SELECT id FROM Comments WHERE idPost = %s AND idUser = %s AND content = %s LIMIT 1", (post_id, user_id, content.strip()))
+        if result := cursor.fetchone():
+            connection.close()
+            return result[0]
+        cursor.execute("INSERT INTO Comments (idPost, idUser, content, actionAt) VALUES (%s, %s, %s, NOW())", (post_id, user_id, content.strip()))
+        connection.commit()
+        cid = cursor.lastrowid
+        connection.close()
+        return cid
+    except: return None
+
+def insert_comment_photo(comment_id, photo_url):
+    try:
+        local_path = download_image(photo_url, os.path.join(image_folder, f"cmt_{uuid.uuid4()}.jpg"))
+        if not local_path: return
+        formatted_path = f"[img]{local_path}[/img]"
+        connection = connect_to_database()
+        cursor = connection.cursor()
+        cursor.execute("INSERT INTO CommentPhotos (CommentID, PhotoURL, UploadTime) VALUES (%s, %s, NOW())", (comment_id, formatted_path))
+        connection.commit()
+        connection.close()
+    except: pass
+
+def generate_post_id(username, content):
+    unique_string = f"{username}_{content}"
+    return hashlib.md5(unique_string.encode()).hexdigest()
+
+def download_image(image_url, save_path):
+    try:
+        if not image_url: return None
+        response = requests.get(image_url, stream=True)
+        if response.status_code == 200:
+            with open(save_path, "wb") as file:
+                for chunk in response.iter_content(1024):
+                    file.write(chunk)
+            return save_path
+    except: pass
+    return None
+
+# ==========================================
+# 3. SELENIUM HELPER FUNCTIONS (CỰC MẠNH)
+# ==========================================
+def click_see_more(driver, post_element):
+    try:
+        buttons = post_element.find_elements(
+            By.XPATH,
+            ".//div[@role='button' and (contains(., 'Xem thêm') or contains(., 'See more'))]"
+        )
+        for btn in buttons:
+            if btn.is_displayed():
+                driver.execute_script("arguments[0].click();", btn)
+                time.sleep(0.5)
+    except:
+        pass
+
+def open_comments_panel(driver, post_element):
+    """
+    Tìm mọi cách để mở panel bình luận:
+    1. Click nút Action 'Bình luận'
+    2. Click dòng chữ '188 bình luận'
+    3. Chuyển filter sang 'Tất cả bình luận'
+    """
+    has_clicked = False
+    
+    # 1. Click vào dòng chữ đếm số bình luận (VD: "290 bình luận")
+    # Đây là cách hiệu quả nhất để mở comment
+    try:
+        count_btns = post_element.find_elements(By.XPATH, ".//span[contains(text(), 'bình luận') or contains(text(), 'comment')]")
+        # Click cái cuối cùng (thường là dòng tổng kết ở góc phải)
+        if count_btns:
+            target = count_btns[-1]
+            if target.is_displayed():
+                driver.execute_script("arguments[0].click();", target)
+                # print("  -> Đã click vào dòng đếm bình luận.")
+                time.sleep(3)
+                has_clicked = True
+    except: pass
+
+    # 2. Nếu chưa được, Click nút Action Bar
+    if not has_clicked:
         try:
-            postDict = dict()
-            postDict['Post'] = _extract_post_text(item)
-            postDict['Link'] = _extract_link(item) or _extract_post_id(item)
-            postDict['PostId'] = _extract_post_id(item)
-            postDict['Image'] = _extract_image(item)
-            postDict['Shares'] = _extract_shares(item)
-            postDict['Comments'] = _extract_comments(item) if _extract_comments(item) else {}
+            action_btns = post_element.find_elements(By.XPATH, ".//div[@role='button'][contains(., 'Bình luận') or contains(., 'Comment')]")
+            for btn in reversed(action_btns): # Nút action thường ở cuối list
+                if btn.is_displayed():
+                    driver.execute_script("arguments[0].click();", btn)
+                    # print("  -> Đã click nút Action bình luận.")
+                    time.sleep(3)
+                    has_clicked = True
+                    break
+        except: pass
+    
+    return has_clicked
 
-            # Bỏ qua posts không có nội dung
-            if not postDict['Post'] and not postDict['Image']:
-                continue
+def switch_to_all_comments(driver, container):
+    """Chuyển filter từ 'Phù hợp nhất' sang 'Tất cả bình luận'"""
+    try:
+        # Tìm nút Filter (thường có chữ Phù hợp nhất / Most relevant)
+        filter_btn = None
+        candidates = container.find_elements(By.XPATH, ".//span[contains(text(), 'Phù hợp nhất') or contains(text(), 'Most relevant')]")
+        
+        # Lội ngược lên tìm role=button cha
+        for cand in candidates:
+            try:
+                parent = cand.find_element(By.XPATH, "./ancestor::div[@role='button'][1]")
+                if parent.is_displayed():
+                    filter_btn = parent
+                    break
+            except: pass
+        
+        if filter_btn:
+            driver.execute_script("arguments[0].click();", filter_btn)
+            time.sleep(2)
+            
+            # Chọn 'Tất cả bình luận' trong Menu vừa hiện ra
+            # Menu thường nằm ở cuối body (role=menu hoặc role=menuitem)
+            all_comments_opts = driver.find_elements(By.XPATH, "//span[contains(text(), 'Tất cả bình luận') or contains(text(), 'All comments')]")
+            for opt in all_comments_opts:
+                if opt.is_displayed():
+                    driver.execute_script("arguments[0].click();", opt)
+                    print("  -> Đã chuyển sang 'Tất cả bình luận'")
+                    time.sleep(3)
+                    return True
+    except: pass
+    return False
 
-            #Add to check
-            postBigDict.append(postDict)
-            with open('./postBigDict.json','w', encoding='utf-8') as file:
-                file.write(json.dumps(postBigDict, ensure_ascii=False).encode('utf-8').decode())
-        except Exception as e:
-            print(f"Error extracting post: {e}")
-            continue
+def expand_all_comments(driver, container_element):
+    """Click 'Xem thêm bình luận' (View more comments)"""
+    print("  -> Đang quét mở rộng...")
+    
+    keywords = [
+        "Xem thêm bình luận", "View more comments", 
+        "Xem các bình luận trước", "View previous comments",
+        "Xem tất cả", "View all",
+        "phản hồi", "replies", "reply", "trả lời",
+    ]
+    
+    # Tìm mọi thẻ chứa text, không quan tâm cấu trúc
+    xpath_query = " | ".join([f".//*[contains(text(), '{kw}')]" for kw in keywords])
 
-    return postBigDict
-
+    max_retries = 10 
+    for _ in range(max_retries):
+        try:
+            # Tìm tất cả các thẻ chứa text này
+            elements = container_element.find_elements(By.XPATH, xpath_query)
+            if not elements: break
+            
+            clicked_any = False
+            for el in elements:
+                try:
+                    if el.is_displayed():
+                        # Trick: Click chính nó, hoặc click cha nó nếu nó là span
+                        driver.execute_script("arguments[0].click();", el)
+                        time.sleep(1)
+                        clicked_any = True
+                except: continue
+            
+            if not clicked_any: break
+        except: break
 
 def _login(browser, email, password):
+    """
+    Hàm login được lấy nguyên văn logic từ scraper.py
+    (Đã cập nhật thêm trường hợp nút Log in là div)
+    """
+    print("Starting Login process...")
     browser.get("http://facebook.com")
     browser.maximize_window()
     time.sleep(3)
@@ -259,208 +354,342 @@ def _login(browser, email, password):
     # Wait for email field to be present
     wait = WebDriverWait(browser, 15)
     email_field = wait.until(EC.presence_of_element_located((By.NAME, "email")))
+    email_field.clear()
     email_field.send_keys(email)
     
     # Wait for password field and fill it
     password_field = wait.until(EC.presence_of_element_located((By.NAME, "pass")))
+    password_field.clear()
     password_field.send_keys(password)
     
-    # Wait for login button - try different selectors
+    # Wait for login button - try different selectors (robust logic)
     try:
-        # Try ID first (older Facebook version)
+        # 1. Try ID first (older Facebook version)
         login_button = wait.until(EC.element_to_be_clickable((By.ID, 'loginbutton')))
     except:
-        # Try button with type='submit'
         try:
+            # 2. Try button with name='login'
             login_button = wait.until(EC.element_to_be_clickable((By.XPATH, '//button[@name="login"]')))
         except:
-            # Try any submit button
-            login_button = wait.until(EC.element_to_be_clickable((By.XPATH, '//button[@type="submit"]')))
+            try:
+                # 3. Try any button type='submit'
+                login_button = wait.until(EC.element_to_be_clickable((By.XPATH, '//button[@type="submit"]')))
+            except:
+                # 4. [MỚI] Try div role='button' chứa text 'Log in' (trường hợp mới thêm)
+                login_button = wait.until(EC.element_to_be_clickable((
+                    By.XPATH, 
+                    "//div[@role='button'][.//span[contains(text(), 'Log in')]]"
+                )))
     
     login_button.click()
-    time.sleep(5)
+    print("Login button clicked. Waiting for redirection...")
+    time.sleep(10) # Chờ load sau login
 
+# ==========================================
+# 1. HÀM TÁCH RIÊNG: XỬ LÝ COMMENT
+# ==========================================
 
-def _count_needed_scrolls(browser, infinite_scroll, numOfPost, is_group=False):
-    if infinite_scroll:
-        lenOfPage = browser.execute_script(
-            "window.scrollTo(0, document.body.scrollHeight);var lenOfPage=document.body.scrollHeight;return lenOfPage;"
+def crawl_comments(driver, post_element, db_post_id):
+    print("--- Bắt đầu xử lý bình luận ---")
+    
+    # B1: Mở panel
+    has_opened = open_comments_panel(driver, post_element)
+    
+    # Chờ popup render
+    if has_opened:
+        time.sleep(3) 
+
+    # B2: Xác định Container
+    comment_container = post_element 
+    is_popup = False
+    
+    try:
+        # Tìm Dialog đang hiển thị
+        dialogs = driver.find_elements(By.XPATH, "//div[@role='dialog']")
+        for dialog in dialogs:
+            if dialog.is_displayed():
+                print("  -> 🟢 Đã bắt được Popup Dialog!")
+                comment_container = dialog
+                is_popup = True
+                break
+    except: pass
+
+    # B3: Chuyển sang 'Tất cả bình luận'
+    switch_to_all_comments(driver, comment_container)
+
+    # B4: Mở rộng các bình luận
+    expand_all_comments(driver, comment_container)
+
+    # B5: Quét & Insert Database
+    # Lọc kỹ để không lấy nhầm text của bài post gốc
+    all_comments = comment_container.find_elements(By.XPATH, ".//div[@role='article'][.//div[@dir='auto']]")
+    
+    if len(all_comments) <= 1:
+        all_comments = comment_container.find_elements(By.XPATH, ".//div[@aria-label and contains(@class, 'x1r8uery')]")
+
+    print(f"  -> Tìm thấy {len(all_comments)} bình luận.")
+
+    count_inserted = 0
+    for c_elem in all_comments:
+        try:
+            # --- Lấy nội dung text ---
+            c_text = ""
+            try:
+                text_div = c_elem.find_element(By.XPATH, ".//div[@dir='auto']")
+                c_text = text_div.text.strip()
+            except: 
+                c_text = c_elem.text.strip()
+            
+            # Bỏ qua nếu text giống hệt bài post
+            if len(c_text) > 20 and c_text in post_element.text:
+                continue
+
+            # --- Lấy tên User ---
+            c_user = ""
+            try:
+                user_el = c_elem.find_element(By.XPATH, ".//span[contains(@class, 'xt0psk2')] | .//a[contains(@href, '/user/') or contains(@href, 'profile.php')]//span")
+                c_user = user_el.text.strip()
+            except:
+                aria = c_elem.get_attribute("aria-label") or ""
+                if "Bình luận" in aria or "Comment" in aria:
+                    c_user = re.sub(r'^(Bình luận của|Comment by|Bình luận dưới tên)\s+', '', aria).split(" vào ")[0]
+            
+            if not c_user and c_text:
+                lines = c_elem.text.split('\n')
+                if lines: c_user = lines[0]
+
+            if not c_user or len(c_user) > 50: continue 
+
+            # --- Lấy ảnh comment ---
+            c_img_url = None
+            try:
+                c_imgs = c_elem.find_elements(By.TAG_NAME, "img")
+                for ci in c_imgs:
+                    width = int(ci.get_attribute("width") or 0)
+                    height = int(ci.get_attribute("height") or 0)
+                    src = ci.get_attribute("src")
+                    if src and "emoji" not in src and (width > 50 or height > 50):
+                        c_img_url = src
+                        break
+            except: pass
+
+            # --- Insert vào Database ---
+            if c_text or c_img_url:
+                insert_user_to_db(c_user)
+                c_user_id = get_user_id(c_user)
+                if c_user_id:
+                    c_id = insert_comment(db_post_id, c_user_id, c_text)
+                    if c_img_url and c_id:
+                        insert_comment_photo(c_id, c_img_url)
+                    count_inserted += 1
+
+        except Exception: continue
+            
+    print(f"  -> Đã lưu {count_inserted} bình luận vào DB.")
+
+    # ==========================================
+    # PHẦN SỬA LỖI ĐÓNG POPUP (QUAN TRỌNG)
+    # ==========================================
+    if is_popup:
+        print("  -> Đang đóng Popup...")
+        # 1. Cố gắng click vào nút đóng (Close Button)
+        try:
+            # XPath tìm nút đóng dựa trên HTML bạn cung cấp
+            close_btn = driver.find_element(By.XPATH, "//div[@role='dialog']//div[@aria-label='Close'][@role='button']")
+            driver.execute_script("arguments[0].click();", close_btn)
+            time.sleep(0.5)
+        except:
+            # Fallback: Nếu không tìm thấy nút, nhấn ESC
+            try:
+                webdriver.ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+            except: pass
+
+        # 2. CHỜ CHO ĐẾN KHI POPUP BIẾN MẤT HẲN (BẮT BUỘC)
+        # Nếu không có đoạn này, code chạy tiếp sẽ thấy dialog cũ và lấy lại comment cũ
+        try:
+            WebDriverWait(driver, 5).until(
+                EC.invisibility_of_element_located((By.XPATH, "//div[@role='dialog']"))
+            )
+            print("  -> 🟢 Popup đã đóng hoàn toàn.")
+        except TimeoutException:
+            print("  -> 🔴 Cảnh báo: Popup kẹt! Thử nhấn ESC lần cuối.")
+            webdriver.ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+            time.sleep(2)
+
+# ==========================================
+# 1. HÀM XỬ LÝ 1 BÀI VIẾT (CRAWL_POST)
+# ==========================================
+
+def crawl_post(driver, story_el, seen_posts):
+    try:
+        # Đưa story vào giữa màn hình
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});",
+            story_el
         )
-    else:
-        # roughly posts per scroll: groups tend to load fewer posts per scroll
-        posts_per_scroll = 4 if is_group else 8
-        lenOfPage = max(1, math.ceil(numOfPost / posts_per_scroll))
-    print("Number Of Scrolls Needed " + str(lenOfPage))
-    return lenOfPage
+        time.sleep(1.5)
 
+        # Click "Xem thêm" nếu có
+        click_see_more(driver, story_el)
 
-def _scroll(browser, infinite_scroll, lenOfPage):
-    lastCount = -1
-    match = False
+        # Đợi text render (tối đa ~8s)
+        text = ""
+        for _ in range(8):
+            text = story_el.text.strip()
+            if len(text) >= 10:
+                break
+            time.sleep(1)
 
-    while not match:
-        if infinite_scroll:
-            lastCount = lenOfPage
+        if not text or len(text) < 10:
+            print("  -> Skip: story_message chưa có text")
+            return False
+
+        # Chống trùng
+        post_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
+        if post_hash in seen_posts:
+            print("  -> Skip: trùng bài")
+            return False
+
+        seen_posts.add(post_hash)
+
+        # ===== DEBUG IN FULL =====
+        print("\n================ POST =================")
+        print(text)
+        print("======================================\n")
+
+        # =========================
+        # INSERT POST → DB
+        # =========================
+        username = "Facebook User"
+        insert_user_to_db(username)
+        user_id = get_user_id(username)
+
+        post_time = datetime.now()
+        post_id = insert_into_forumposts(
+            user_id=user_id,
+            group_id=1,
+            title=text[:150],
+            content=text,
+            post_time=post_time,
+            ip_posted="127.0.0.1",
+            post_latitude=None,
+            post_longitude=None,
+            time_view=0,
+            district_id=None,
+            provinces_id=get_provinces_id_from_title(text)
+        )
+
+        if not post_id:
+            print("  -> ❌ Không insert được post")
+            return False
+
+        print(f"  -> ✅ Insert PostID = {post_id}")
+
+        # =========================
+        # CRAWL COMMENT NGAY SAU POST
+        # =========================
+        post_article = None
+        
+        # Thử nhiều cách để tìm thẻ bao ngoài (Container) chứa cả nút Like/Comment
+        xpaths_to_try = [
+            "./ancestor::div[@role='article'][1]",       # Cách cũ (chuẩn)
+            "./ancestor::div[@aria-posinset][1]",        # Cách tìm theo feed index
+            "./ancestor::div[contains(@class, 'x1yztbdb')][1]", # Class bao ngoài phổ biến mới
+            "./../../../../.."                           # Cách "cục súc": Leo lên 5 cấp cha
+        ]
+
+        for xpath in xpaths_to_try:
+            try:
+                post_article = story_el.find_element(By.XPATH, xpath)
+                if post_article:
+                    break
+            except:
+                continue
+        
+        if post_article:
+            crawl_comments(driver, post_article, post_id)
         else:
-            lastCount += 1
-
-        # wait for the browser to load, this time can be changed slightly ~3 seconds with no difference, but 5 seems
-        # to be stable enough
-        # wait a bit longer to allow XHR-rendered content to appear
-        time.sleep(6)
-
-        if infinite_scroll:
-            lenOfPage = browser.execute_script(
-                "window.scrollTo(0, document.body.scrollHeight);var lenOfPage=document.body.scrollHeight;return "
-                "lenOfPage;")
-        else:
-            browser.execute_script(
-                "window.scrollTo(0, document.body.scrollHeight);var lenOfPage=document.body.scrollHeight;return "
-                "lenOfPage;")
-
-        if lastCount == lenOfPage:
-            match = True
+            print("  -> ⚠️ Cảnh báo: Không tìm thấy thẻ bao bài viết (post container), bỏ qua comment.")
 
 
-def extract(page, numOfPost, infinite_scroll=False, scrape_comment=False):
+        return True
+    except StaleElementReferenceException:
+        print("  -> Skip: stale element")
+        return False
+    except Exception as e:
+        print("❌ crawl_post error:", e)
+        return False
+
+
+# ===========================
+# 2. HÀM CHÍNH (CRAWL_PAGE) 
+# ===========================
+
+def crawl_page():
     option = Options()
     option.add_argument("--disable-infobars")
     option.add_argument("start-maximized")
     option.add_argument("--disable-extensions")
+    option.add_experimental_option(
+        "prefs", {"profile.default_content_setting_values.notifications": 1}
+    )
 
-    # Pass the argument 1 to allow and 2 to block
-    option.add_experimental_option("prefs", {
-        "profile.default_content_setting_values.notifications": 1
-    })
+    try:
+        driver = webdriver.Chrome(service=Service("./chromedriver"), options=option)
+    except:
+        driver = webdriver.Chrome(options=option)
 
-    # Kiểm tra xem có phải Facebook Group không
-    is_group = "/groups/" in page
+    driver.set_page_load_timeout(180)
 
-    # chromedriver should be in the same folder as file
-    service = Service("./chromedriver")
-    browser = webdriver.Chrome(service=service, options=option)
-    browser.set_page_load_timeout(180)  # Tăng timeout lên 180 giây (3 phút)
-    _login(browser, EMAIL, PASSWORD)
-    browser.get(page)
-    time.sleep(5)  # Chờ trang load xong
-    lenOfPage = _count_needed_scrolls(browser, infinite_scroll, numOfPost, is_group=is_group)
-    _scroll(browser, infinite_scroll, lenOfPage)
+    # ===== LOGIN =====
+    _login(driver, EMAIL, PASSWORD)
 
-    # click on all the comments to scrape them all!
-    # TODO: need to add more support for additional second level comments
-    # TODO: ie. comment of a comment
+    group_url = "https://www.facebook.com/groups/385914624891314?sorting_setting=CHRONOLOGICAL"
+    print("Navigating:", group_url)
+    driver.get(group_url)
 
-    if scrape_comment:
-        #first uncollapse collapsed comments
-        unCollapseCommentsButtonsXPath = '//a[contains(@class,"_666h")]'
-        unCollapseCommentsButtons = browser.find_elements(By.XPATH, unCollapseCommentsButtonsXPath)
-        for unCollapseComment in unCollapseCommentsButtons:
-            action = webdriver.common.action_chains.ActionChains(browser)
-            try:
-                # move to where the un collapse on is
-                action.move_to_element_with_offset(unCollapseComment, 5, 5)
-                action.perform()
-                unCollapseComment.click()
-            except:
-                # do nothing right here
-                pass
+    # Chờ render ban đầu
+    time.sleep(10)
 
-        #second set comment ranking to show all comments
-        rankDropdowns = browser.find_elements(By.CLASS_NAME, '_2pln') #select boxes who have rank dropdowns
-        rankXPath = '//div[contains(concat(" ", @class, " "), "uiContextualLayerPositioner") and not(contains(concat(" ", @class, " "), "hidden_elem"))]//div/ul/li/a[@class="_54nc"]/span/span/div[@data-ordering="RANKED_UNFILTERED"]'
-        for rankDropdown in rankDropdowns:
-            #click to open the filter modal
-            action = webdriver.common.action_chains.ActionChains(browser)
-            try:
-                action.move_to_element_with_offset(rankDropdown, 5, 5)
-                action.perform()
-                rankDropdown.click()
-            except:
-                pass
+    seen_posts = set()
+    crawled_count = 0
+    target_count = 5
+    scroll_round = 0
 
-            # if modal is opened filter comments
-            ranked_unfiltered = browser.find_elements(By.XPATH, rankXPath) # RANKED_UNFILTERED => (All Comments)
-            if len(ranked_unfiltered) > 0:
-                try:
-                    ranked_unfiltered[0].click()
-                except:
-                    pass    
-        
-        moreComments = browser.find_elements(By.XPATH, '//a[@class="_4sxc _42ft"]')
-        print("Scrolling through to click on more comments")
-        while len(moreComments) != 0:
-            for moreComment in moreComments:
-                action = webdriver.common.action_chains.ActionChains(browser)
-                try:
-                    # move to where the comment button is
-                    action.move_to_element_with_offset(moreComment, 5, 5)
-                    action.perform()
-                    moreComment.click()
-                except:
-                    # do nothing right here
-                    pass
+    while crawled_count < target_count:
+        # 👉 LẤY TRỰC TIẾP STORY_MESSAGE
+        story_elements = driver.find_elements(
+            By.XPATH,
+            "//div[@data-ad-rendering-role='story_message']"
+        )
 
-            moreComments = browser.find_elements(By.XPATH, '//a[@class="_4sxc _42ft"]')
+        print(f"DEBUG: Found {len(story_elements)} story_message in round {scroll_round}")
 
-    # Now that the page is fully scrolled, grab the source code.
-    source_data = browser.page_source
+        for story in story_elements:
+            if crawled_count >= target_count:
+                break
 
-    # Throw your source into BeautifulSoup and start parsing!
-    bs_data = bs(source_data, 'html.parser')
+            is_new = crawl_post(driver, story, seen_posts)
 
-    postBigDict = _extract_html(bs_data, is_group=is_group)
-    browser.close()
+            if is_new:
+                crawled_count += 1
+                print(f"✅ Progress {crawled_count}/{target_count}")
 
-    return postBigDict
+        # ===== SCROLL NHẸ SAU KHI QUÉT XONG =====
+        scroll_round += 1
+        print(f"↘ Đang scroll lần {scroll_round} để tìm bài mới...")
 
+
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+
+        time.sleep(10)
+
+        # Chống scroll vô hạn
+        if scroll_round >= 100:
+            print(f"⛔ Đã scroll {scroll_round} lần mà không tìm đủ bài. Dừng để tránh lặp vô hạn.")
+            break
+
+    print(f"🎉 DONE crawl_page. Tổng bài lấy được: {crawled_count}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Facebook Page Scraper")
-    required_parser = parser.add_argument_group("required arguments")
-    required_parser.add_argument('-page', '-p', help="The Facebook Public Page you want to scrape", required=True)
-    required_parser.add_argument('-len', '-l', help="Number of Posts you want to scrape", type=int, required=True)
-    optional_parser = parser.add_argument_group("optional arguments")
-    optional_parser.add_argument('-infinite', '-i',
-                                 help="Scroll until the end of the page (1 = infinite) (Default is 0)", type=int,
-                                 default=0)
-    optional_parser.add_argument('-usage', '-u', help="What to do with the data: "
-                                                      "Print on Screen (PS), "
-                                                      "Write to Text File (WT) (Default is WT)", default="CSV")
-
-    optional_parser.add_argument('-comments', '-c', help="Scrape ALL Comments of Posts (y/n) (Default is n). When "
-                                                         "enabled for pages where there are a lot of comments it can "
-                                                         "take a while", default="No")
-    args = parser.parse_args()
-
-    infinite = False
-    if args.infinite == 1:
-        infinite = True
-
-    scrape_comment = False
-    if args.comments == 'y':
-        scrape_comment = True
-
-    postBigDict = extract(page=args.page, numOfPost=args.len, infinite_scroll=infinite, scrape_comment=scrape_comment)
-
-
-    #TODO: rewrite parser
-    if args.usage == "WT":
-        with open('output.txt', 'w') as file:
-            for post in postBigDict:
-                file.write(json.dumps(post))  # use json load to recover
-
-    elif args.usage == "CSV":
-        with open('data.csv', 'w',) as csvfile:
-           writer = csv.writer(csvfile)
-           #writer.writerow(['Post', 'Link', 'Image', 'Comments', 'Reaction'])
-           writer.writerow(['Post', 'Link', 'Image', 'Comments', 'Shares'])
-
-           for post in postBigDict:
-              writer.writerow([post['Post'], post['Link'],post['Image'], post['Comments'], post['Shares']])
-              #writer.writerow([post['Post'], post['Link'],post['Image'], post['Comments'], post['Reaction']])
-
-    else:
-        for post in postBigDict:
-            print(post)
-
-    print("Finished")
+    crawl_page()

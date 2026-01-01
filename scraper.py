@@ -46,7 +46,18 @@ try:
 except FileNotFoundError:
     print("Warning: 'facebook_credentials.txt' not found.")
 
-image_folder = r"/var/www/thinkdiff-web/vang247_xyz/image_tintuc/"
+# CẤU HÌNH THƯ MỤC LƯU ẢNH POST
+# Lấy đường dẫn thư mục hiện tại chứa file scraper.py
+current_dir = os.path.dirname(os.path.abspath(__file__))
+post_image_folder = os.path.join(current_dir, "img", "img_posts")
+
+if not os.path.exists(post_image_folder):
+    os.makedirs(post_image_folder)
+
+# image_folder = r"/var/www/thinkdiff-web/vang247_xyz/image_tintuc/"
+
+image_folder = os.path.join(current_dir, "img", "img_comments")
+
 if not os.path.exists(image_folder):
     os.makedirs(image_folder)
 
@@ -224,17 +235,18 @@ def download_image(image_url, save_path):
 # ==========================================
 # 3. SELENIUM HELPER FUNCTIONS (CỰC MẠNH)
 # ==========================================
-
-def click_see_more(driver, element):
+def click_see_more(driver, post_element):
     try:
-        btns = element.find_elements(By.XPATH, ".//div[@role='button'][contains(., 'Xem thêm') or contains(., 'See more')]")
-        for btn in btns:
+        buttons = post_element.find_elements(
+            By.XPATH,
+            ".//div[@role='button' and (contains(., 'Xem thêm') or contains(., 'See more'))]"
+        )
+        for btn in buttons:
             if btn.is_displayed():
                 driver.execute_script("arguments[0].click();", btn)
-                time.sleep(1)
-                return True
-    except: pass
-    return False
+                time.sleep(0.5)
+    except:
+        pass
 
 def open_comments_panel(driver, post_element):
     """
@@ -341,240 +353,482 @@ def expand_all_comments(driver, container_element):
         except: break
 
 def _login(browser, email, password):
+    """
+    Hàm login được lấy nguyên văn logic từ scraper.py
+    (Đã cập nhật thêm trường hợp nút Log in là div)
+    """
     print("Starting Login process...")
     browser.get("http://facebook.com")
     browser.maximize_window()
-    time.sleep(2)
+    time.sleep(3)
+    
+    # Wait for email field to be present
+    wait = WebDriverWait(browser, 15)
+    email_field = wait.until(EC.presence_of_element_located((By.NAME, "email")))
+    email_field.clear()
+    email_field.send_keys(email)
+    
+    # Wait for password field and fill it
+    password_field = wait.until(EC.presence_of_element_located((By.NAME, "pass")))
+    password_field.clear()
+    password_field.send_keys(password)
+    
+    # Wait for login button - try different selectors (robust logic)
     try:
-        wait = WebDriverWait(browser, 15)
-        email_field = wait.until(EC.presence_of_element_located((By.NAME, "email")))
-        email_field.send_keys(email)
-        pass_field = browser.find_element(By.NAME, "pass")
-        pass_field.send_keys(password)
-        pass_field.send_keys(Keys.ENTER)
-        print("Login submitted. Waiting...")
-        time.sleep(10)
-    except Exception as e:
-        print(f"Login error: {e}")
+        # 1. Try ID first (older Facebook version)
+        login_button = wait.until(EC.element_to_be_clickable((By.ID, 'loginbutton')))
+    except:
+        try:
+            # 2. Try button with name='login'
+            login_button = wait.until(EC.element_to_be_clickable((By.XPATH, '//button[@name="login"]')))
+        except:
+            try:
+                # 3. Try any button type='submit'
+                login_button = wait.until(EC.element_to_be_clickable((By.XPATH, '//button[@type="submit"]')))
+            except:
+                # 4. [MỚI] Try div role='button' chứa text 'Log in' (trường hợp mới thêm)
+                login_button = wait.until(EC.element_to_be_clickable((
+                    By.XPATH, 
+                    "//div[@role='button'][.//span[contains(text(), 'Log in')]]"
+                )))
+    
+    login_button.click()
+    print("Login button clicked. Waiting for redirection...")
+    time.sleep(10) # Chờ load sau login
+
+def scroll_inside_popup(driver, popup_element):
+    """
+    Scroll thông minh trong Popup:
+    - Duyệt qua TOÀN BỘ các thẻ div.
+    - Tìm thẻ nào có khả năng cuộn (scrollHeight > clientHeight).
+    - CHỌN THẺ CÓ SCROLLHEIGHT LỚN NHẤT (Đây chính là container chứa comment).
+    - Cuộn thẻ đó xuống đáy.
+    """
+    print("  -> 📜 Đang cuộn comment trong Popup...")
+    
+    max_scroll_attempts = 15 
+    
+    for i in range(max_scroll_attempts):
+        # Dùng JS để tìm đúng thẻ div "bự" nhất để cuộn
+        scrolled = driver.execute_script("""
+            var popup = arguments[0];
+            var divs = popup.getElementsByTagName('div');
+            var targetDiv = null;
+            var maxScrollHeight = 0;
+
+            for (var i = 0; i < divs.length; i++) {
+                var d = divs[i];
+                
+                // Điều kiện:
+                // 1. Có nội dung ẩn (scrollHeight > clientHeight)
+                // 2. Chiều cao hiển thị đủ lớn (> 100px) để tránh mấy cái nút/icon
+                // 3. Không phải thanh cuộn ảo (data-thumb)
+                if (d.scrollHeight > d.clientHeight && d.clientHeight > 100 && !d.getAttribute('data-thumb')) {
+                    
+                    // Logic mới: So sánh để tìm thằng có nội dung dài nhất
+                    if (d.scrollHeight > maxScrollHeight) {
+                        maxScrollHeight = d.scrollHeight;
+                        targetDiv = d;
+                    }
+                }
+            }
+
+            if (targetDiv) {
+                // Scroll mượt hơn một chút thay vì set thẳng tắp
+                targetDiv.scrollTop = targetDiv.scrollHeight;
+                return true;
+            }
+            return false;
+        """, popup_element)
+        
+        # Nếu JS không tìm thấy (hiếm khi xảy ra với logic mới), dùng phím END
+        if not scrolled:
+            try:
+                actions = ActionChains(driver)
+                actions.move_to_element(popup_element).click().send_keys(Keys.END).perform()
+                time.sleep(0.5)
+            except: pass
+
+        time.sleep(2.5) # Tăng time sleep lên chút để Facebook kịp tải Ajax
+
+        # Kết hợp mở rộng comment
+        expand_all_comments(driver, popup_element)
+    
+    print("  -> ✅ Đã cuộn xong popup.")
+
 
 # ==========================================
-# 4. MAIN CRAWL FUNCTION (FULL LOGIC)
+# 1. HÀM TÁCH RIÊNG: XỬ LÝ COMMENT
 # ==========================================
+
+def crawl_comments(driver, post_element, db_post_id):
+    print("--- Bắt đầu xử lý bình luận ---")
+    
+    # B1: Mở panel
+    has_opened = open_comments_panel(driver, post_element)
+    
+    # Chờ popup render
+    if has_opened:
+        time.sleep(3) 
+
+    # B2: Xác định Container
+    comment_container = post_element 
+    is_popup = False
+    
+    try:
+        # Tìm Dialog đang hiển thị
+        dialogs = driver.find_elements(By.XPATH, "//div[@role='dialog']")
+        for dialog in dialogs:
+            if dialog.is_displayed():
+                print("  -> 🟢 Đã bắt được Popup Dialog!")
+                comment_container = dialog
+                is_popup = True
+                break
+    except: pass
+
+    # B3: Chuyển sang 'Tất cả bình luận'
+    switch_to_all_comments(driver, comment_container)
+
+    # B4: Mở rộng các bình luận
+    if is_popup:
+        # Gọi hàm scroll mới viết
+        scroll_inside_popup(driver, comment_container)
+    else:
+        # Nếu không phải popup (hiển thị ngay trên feed), scroll trang chính nhẹ một chút
+        driver.execute_script("window.scrollBy(0, 300);")
+        time.sleep(1)
+        expand_all_comments(driver, comment_container)
+
+    # B5: Quét & Insert Database
+    # Lọc kỹ để không lấy nhầm text của bài post gốc
+    all_comments = comment_container.find_elements(By.XPATH, ".//div[@role='article'][.//div[@dir='auto']]")
+    
+    if len(all_comments) <= 1:
+        all_comments = comment_container.find_elements(By.XPATH, ".//div[@aria-label and contains(@class, 'x1r8uery')]")
+
+    print(f"  -> Tìm thấy {len(all_comments)} bình luận.")
+
+    count_inserted = 0
+    for c_elem in all_comments:
+        try:
+            # --- Lấy nội dung text ---
+            c_text = ""
+            try:
+                text_div = c_elem.find_element(By.XPATH, ".//div[@dir='auto']")
+                c_text = text_div.text.strip()
+            except: 
+                c_text = c_elem.text.strip()
+            
+            # Bỏ qua nếu text giống hệt bài post
+            if len(c_text) > 20 and c_text in post_element.text:
+                continue
+
+            # --- Lấy tên User ---
+            c_user = ""
+            try:
+                user_el = c_elem.find_element(By.XPATH, ".//span[contains(@class, 'xt0psk2')] | .//a[contains(@href, '/user/') or contains(@href, 'profile.php')]//span")
+                c_user = user_el.text.strip()
+            except:
+                aria = c_elem.get_attribute("aria-label") or ""
+                if "Bình luận" in aria or "Comment" in aria:
+                    c_user = re.sub(r'^(Bình luận của|Comment by|Bình luận dưới tên)\s+', '', aria).split(" vào ")[0]
+            
+            if not c_user and c_text:
+                lines = c_elem.text.split('\n')
+                if lines: c_user = lines[0]
+
+            if not c_user or len(c_user) > 50: continue 
+
+            # --- Lấy ảnh comment ---
+            c_img_url = None
+            try:
+                c_imgs = c_elem.find_elements(By.TAG_NAME, "img")
+                for ci in c_imgs:
+                    width = int(ci.get_attribute("width") or 0)
+                    height = int(ci.get_attribute("height") or 0)
+                    src = ci.get_attribute("src")
+                    if src and "emoji" not in src and (width > 50 or height > 50):
+                        c_img_url = src
+                        break
+            except: pass
+
+            # --- Insert vào Database ---
+            if c_text or c_img_url:
+                insert_user_to_db(c_user)
+                c_user_id = get_user_id(c_user)
+                if c_user_id:
+                    c_id = insert_comment(db_post_id, c_user_id, c_text)
+                    if c_img_url and c_id:
+                        insert_comment_photo(c_id, c_img_url)
+                    count_inserted += 1
+
+        except Exception: continue
+            
+    print(f"  -> Đã lưu {count_inserted} bình luận vào DB.")
+
+    # ==========================================
+    # PHẦN SỬA LỖI ĐÓNG POPUP (QUAN TRỌNG)
+    # ==========================================
+    if is_popup:
+        print("  -> Đang đóng Popup...")
+        # 1. Cố gắng click vào nút đóng (Close Button)
+        try:
+            # XPath tìm nút đóng dựa trên HTML bạn cung cấp
+            close_btn = driver.find_element(By.XPATH, "//div[@role='dialog']//div[@aria-label='Close'][@role='button']")
+            driver.execute_script("arguments[0].click();", close_btn)
+            time.sleep(0.5)
+        except:
+            # Fallback: Nếu không tìm thấy nút, nhấn ESC
+            try:
+                webdriver.ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+            except: pass
+
+        # 2. CHỜ CHO ĐẾN KHI POPUP BIẾN MẤT HẲN (BẮT BUỘC)
+        # Nếu không có đoạn này, code chạy tiếp sẽ thấy dialog cũ và lấy lại comment cũ
+        try:
+            WebDriverWait(driver, 5).until(
+                EC.invisibility_of_element_located((By.XPATH, "//div[@role='dialog']"))
+            )
+            print("  -> 🟢 Popup đã đóng hoàn toàn.")
+        except TimeoutException:
+            print("  -> 🔴 Cảnh báo: Popup kẹt! Thử nhấn ESC lần cuối.")
+            webdriver.ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+            time.sleep(2)
+
+# ==========================================
+# 1. HÀM XỬ LÝ 1 BÀI VIẾT (CRAWL_POST)
+# ==========================================
+
+def crawl_post(driver, story_el, seen_posts):
+    try:
+        # --- 1. Scroll và Click xem thêm ---
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});",
+            story_el
+        )
+        time.sleep(1.5)
+        click_see_more(driver, story_el)
+
+        # --- 2. Lấy Text (Giữ nguyên) ---
+        text = ""
+        for _ in range(8):
+            text = story_el.text.strip()
+            if len(text) >= 10:
+                break
+            time.sleep(1)
+
+        if not text or len(text) < 10:
+            print("  -> Skip: story_message chưa có text")
+            return False
+
+        # Chống trùng
+        post_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
+        if post_hash in seen_posts:
+            print("  -> Skip: trùng bài")
+            return False
+
+        seen_posts.add(post_hash)
+
+        # ===== DEBUG IN FULL =====
+        print("\n================ POST =================")
+        print(text)
+        print("======================================\n")
+
+        # --- 3. Insert Post vào DB (Giữ nguyên) ---
+        username = "Facebook User"
+        insert_user_to_db(username)
+        user_id = get_user_id(username)
+
+        post_time = datetime.now()
+        post_id = insert_into_forumposts(
+            user_id=user_id,
+            group_id=1,
+            title=text[:150],
+            content=text,
+            post_time=post_time,
+            ip_posted="127.0.0.1",
+            post_latitude=None,
+            post_longitude=None,
+            time_view=0,
+            district_id=None,
+            provinces_id=get_provinces_id_from_title(text)
+        )
+
+        if not post_id:
+            print("  -> ❌ Không insert được post")
+            return False
+
+        print(f"  -> ✅ Insert PostID = {post_id}")
+
+        # ====================================================
+        # [SỬA LẠI] 4. LẤY ẢNH CỦA BÀI POST & TẢI VỀ
+        # ====================================================
+        try:
+            # BƯỚC QUAN TRỌNG: Leo lên tìm thẻ cha bao trùm cả bài viết (Container)
+            # Vì ảnh nằm NGOÀI story_el (text), nên phải đứng từ Container mới nhìn thấy ảnh
+            post_container = None
+            try:
+                # Cách chuẩn: Tìm thẻ div có role='article' bao quanh story_el
+                post_container = story_el.find_element(By.XPATH, "./ancestor::div[@role='article'][1]")
+            except:
+                try:
+                    # Cách dự phòng: Leo lên 5-6 cấp cha (nếu Facebook đổi cấu trúc)
+                    post_container = story_el.find_element(By.XPATH, "./../../../../..")
+                except: pass
+            
+            # Nếu không tìm được container thì dùng tạm story_el (dù khả năng cao là xịt)
+            search_scope = post_container if post_container else story_el
+
+            # Tìm tất cả thẻ img trong phạm vi Container
+            post_imgs = search_scope.find_elements(By.TAG_NAME, "img")
+            
+            valid_img_url = None
+            
+            for img in post_imgs:
+                try:
+                    # Lấy kích thước thực tế
+                    width = int(img.get_attribute("width") or 0)
+                    height = int(img.get_attribute("height") or 0)
+                    src = img.get_attribute("src")
+                    
+                    # LOGIC LỌC ẢNH:
+                    # 1. Có src và không phải emoji
+                    # 2. Width > 150 (Ảnh trong HTML bạn gửi width=526 -> Thỏa mãn)
+                    # 3. Loại bỏ Avatar (thường nằm trong thẻ post nhưng kích thước nhỏ hoặc vuông 40x40)
+                    if src and "emoji" not in src and width > 150:
+                        
+                        # Kiểm tra kỹ hơn: Bỏ qua ảnh avatar user (thường width=height)
+                        # Ảnh post thường hình chữ nhật hoặc size lớn hẳn
+                        if width < 100 and height < 100: 
+                            continue
+
+                        valid_img_url = src
+                        print(f"  -> 📸 Phát hiện ảnh Post (W:{width}): {src[:50]}...")
+                        break 
+                except: continue
+            
+            # Tải ảnh và Lưu DB
+            if valid_img_url:
+                file_name = f"post_{post_id}_{uuid.uuid4()}.jpg"
+                save_path = os.path.join(post_image_folder, file_name)
+                
+                downloaded_path = download_image(valid_img_url, save_path)
+                
+                if downloaded_path:
+                    print(f"  -> Đã tải ảnh về: {downloaded_path}")
+                    # Insert vào DB
+                    insert_into_forumphotos(post_id, valid_img_url, datetime.now()) # Lưu URL gốc
+                    # Hoặc lưu đường dẫn local:
+                    # insert_into_forumphotos(post_id, f"[img]{save_path}[/img]", datetime.now())
+
+        except Exception as e:
+            print(f"  -> Lỗi lấy ảnh post: {e}")
+
+        # =========================
+        # CRAWL COMMENT NGAY SAU POST
+        # =========================
+        post_article = None
+        
+        # Thử nhiều cách để tìm thẻ bao ngoài (Container) chứa cả nút Like/Comment
+        xpaths_to_try = [
+            "./ancestor::div[@role='article'][1]",       # Cách cũ (chuẩn)
+            "./ancestor::div[@aria-posinset][1]",        # Cách tìm theo feed index
+            "./ancestor::div[contains(@class, 'x1yztbdb')][1]", # Class bao ngoài phổ biến mới
+            "./../../../../.."                           # Cách "cục súc": Leo lên 5 cấp cha
+        ]
+
+        for xpath in xpaths_to_try:
+            try:
+                post_article = story_el.find_element(By.XPATH, xpath)
+                if post_article:
+                    break
+            except:
+                continue
+        
+        if post_article:
+            crawl_comments(driver, post_article, post_id)
+        else:
+            print("  -> ⚠️ Cảnh báo: Không tìm thấy thẻ bao bài viết (post container), bỏ qua comment.")
+
+
+        return True
+    except StaleElementReferenceException:
+        print("  -> Skip: stale element")
+        return False
+    except Exception as e:
+        print("❌ crawl_post error:", e)
+        return False
+
+
+# ===========================
+# 2. HÀM CHÍNH (CRAWL_PAGE) 
+# ===========================
 
 def crawl_page():
-    # --- SETUP ---
     option = Options()
     option.add_argument("--disable-infobars")
     option.add_argument("start-maximized")
     option.add_argument("--disable-extensions")
-    option.add_experimental_option("prefs", {"profile.default_content_setting_values.notifications": 1})
+    option.add_experimental_option(
+        "prefs", {"profile.default_content_setting_values.notifications": 1}
+    )
 
     try:
-        service = Service("./chromedriver")
-        driver = webdriver.Chrome(service=service, options=option)
+        driver = webdriver.Chrome(service=Service("./chromedriver"), options=option)
     except:
         driver = webdriver.Chrome(options=option)
-    
+
     driver.set_page_load_timeout(180)
 
-    # --- LOGIN ---
-    try:
-        _login(driver, EMAIL, PASSWORD)
-    except Exception as e:
-        driver.quit()
-        return
+    # ===== LOGIN =====
+    _login(driver, EMAIL, PASSWORD)
 
-    # --- NAVIGATE ---
     group_url = "https://www.facebook.com/groups/385914624891314?sorting_setting=CHRONOLOGICAL"
-    print(f"Navigating to: {group_url}")
+    print("Navigating:", group_url)
     driver.get(group_url)
-    time.sleep(5)
 
-    crawled_count = 0 
+    # Chờ render ban đầu
+    time.sleep(10)
+
+    seen_posts = set()
+    crawled_count = 0
     target_count = 5
-    index = 0
-    
-    while True:
-        if crawled_count >= target_count:
-            print(f"Đã lấy đủ {target_count} bài viết. Stop.")
+    scroll_round = 0
+
+    while crawled_count < target_count:
+        # 👉 LẤY TRỰC TIẾP STORY_MESSAGE
+        story_elements = driver.find_elements(
+            By.XPATH,
+            "//div[@data-ad-rendering-role='story_message']"
+        )
+
+        print(f"DEBUG: Found {len(story_elements)} story_message in round {scroll_round}")
+
+        for story in story_elements:
+            if crawled_count >= target_count:
+                break
+
+            is_new = crawl_post(driver, story, seen_posts)
+
+            if is_new:
+                crawled_count += 1
+                print(f"✅ Progress {crawled_count}/{target_count}")
+
+        # ===== SCROLL NHẸ SAU KHI QUÉT XONG =====
+        scroll_round += 1
+        print(f"↘ Đang scroll lần {scroll_round} để tìm bài mới...")
+
+
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+
+        time.sleep(10)
+
+        # Chống scroll vô hạn
+        if scroll_round >= 100:
+            print(f"⛔ Đã scroll {scroll_round} lần mà không tìm đủ bài. Dừng để tránh lặp vô hạn.")
             break
 
-        # Tìm Posts
-        try:
-            post_elements = driver.find_elements(By.XPATH, '//div[@role="feed"]//div[@role="article"]')
-            if not post_elements:
-                post_elements = driver.find_elements(By.XPATH, '//div[contains(@class, "x1yztbdb")]')
-        except: post_elements = []
-
-        print(f"DEBUG: Found {len(post_elements)} posts in DOM.")
-        
-        if index >= len(post_elements):
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            print("Scrolling...")
-            time.sleep(5)
-            new_elements = driver.find_elements(By.XPATH, '//div[@role="feed"]//div[@role="article"]')
-            if len(new_elements) <= index:
-                print("No more posts loaded.")
-                break
-            continue
-
-        post_element = post_elements[index]
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", post_element)
-        time.sleep(2)
-
-        try:
-            # 1. TRÍCH XUẤT USER & CONTENT
-            username_text = "Unknown User"
-            try:
-                # Tìm thẻ User (Header)
-                header_el = post_element.find_element(By.XPATH, ".//strong | .//h2//a | .//h3//a")
-                username_text = header_el.text.strip()
-            except: pass
-
-            click_see_more(driver, post_element)
-            content_text = ""
-            try:
-                content_el = post_element.find_element(By.XPATH, ".//div[@data-ad-rendering-role='story_message']")
-                content_text = content_el.text.strip()
-            except:
-                try:
-                    candidates = post_element.find_elements(By.XPATH, ".//div[@dir='auto']")
-                    longest = ""
-                    for c in candidates:
-                        txt = c.text.strip()
-                        if len(txt) > len(longest) and txt != username_text and "Bình luận" not in txt:
-                            longest = txt
-                    content_text = longest
-                except: pass
-            
-            if not content_text: content_text = "No content"
-
-            # 2. INSERT POST
-            post_id_hash = generate_post_id(username_text, content_text)
-            
-            if post_id_hash not in seen_posts:
-                seen_posts.add(post_id_hash)
-                crawled_count += 1
-                
-                print(f"\n--- Processing Post {crawled_count}/{target_count} ---")
-                print(f"User: {username_text}")
-                print(f"Content: {content_text[:50]}...")
-                
-                insert_user_to_db(username_text)
-                user_id = get_user_id(username_text) or 0
-                
-                provinces_id = get_provinces_id_from_title(content_text)
-                district_id = get_district_id_from_title(content_text)
-                
-                db_post_id = insert_into_forumposts(
-                    user_id=user_id, group_id=38, title="", content=content_text, 
-                    post_time=datetime.now(), ip_posted="", post_latitude=0, post_longitude=0, 
-                    time_view=0, district_id=district_id, provinces_id=provinces_id
-                )
-                
-                # Ảnh Post
-                try:
-                    imgs = post_element.find_elements(By.TAG_NAME, "img")
-                    for img in imgs:
-                        src = img.get_attribute("src")
-                        w = int(img.get_attribute("width") or 0)
-                        if src and "https" in src and "emoji" not in src and w > 100:
-                            path = download_image(src, os.path.join(image_folder, f"img_{uuid.uuid4()}.jpg"))
-                            if path and db_post_id:
-                                insert_into_forumphotos(db_post_id, f"[img]{path}[/img]", datetime.now())
-                except: pass
-
-                if db_post_id:
-                    # 3. XỬ LÝ COMMENT
-                    print("--- Bắt đầu xử lý bình luận ---")
-                    
-                    # B1: Mở panel (Click nút đếm hoặc nút action)
-                    open_comments_panel(driver, post_element)
-
-                    # B2: Check Popup
-                    comment_container = post_element
-                    is_popup = False
-                    try:
-                        dialog = driver.find_element(By.XPATH, "//div[@role='dialog']")
-                        if dialog.is_displayed():
-                            print("  -> Popup detected.")
-                            comment_container = dialog
-                            is_popup = True
-                    except: pass
-
-                    # B3: Chuyển sang 'Tất cả bình luận' (Quan trọng!)
-                    switch_to_all_comments(driver, comment_container)
-
-                    # B4: Mở rộng
-                    expand_all_comments(driver, comment_container)
-
-                    # B5: Quét & Insert
-                    all_comments = comment_container.find_elements(By.XPATH, ".//div[@role='article']")
-                    print(f"  -> Tìm thấy {len(all_comments)} bình luận.")
-
-                    for c_elem in all_comments:
-                        try:
-                            # User
-                            c_user = ""
-                            try:
-                                # Tìm thẻ có class đặc biệt của user name hoặc thẻ link
-                                user_el = c_elem.find_element(By.XPATH, ".//span[contains(@class, 'xt0psk2')] | .//a[contains(@href, 'user') or contains(@href, 'profile')]//span")
-                                c_user = user_el.text.strip()
-                            except:
-                                # Fallback Aria
-                                aria = c_elem.get_attribute("aria-label") or ""
-                                if "Bình luận" in aria or "Comment" in aria:
-                                    c_user = aria.split(" vào ")[0].replace("Bình luận của ", "").replace("Comment by ", "").replace("Bình luận dưới tên ", "")
-                            
-                            if not c_user or len(c_user) > 50: 
-                                # Thử lấy dòng text đầu tiên (nguy hiểm nhưng cần thiết)
-                                lines = c_elem.text.split('\n')
-                                if lines: c_user = lines[0]
-
-                            if len(c_user) > 50: continue
-
-                            # Text
-                            c_text = ""
-                            try:
-                                c_text = c_elem.find_element(By.XPATH, ".//div[@dir='auto']").text.strip()
-                            except: pass
-                            
-                            # Image
-                            c_img_url = None
-                            try:
-                                c_imgs = c_elem.find_elements(By.TAG_NAME, "img")
-                                for ci in c_imgs:
-                                    src = ci.get_attribute("src")
-                                    if src and "emoji" not in src and int(ci.get_attribute("width") or 0) > 100:
-                                        c_img_url = src
-                                        break
-                            except: pass
-
-                            if c_text or c_img_url:
-                                # print(f"    + {c_user}: {c_text[:15]}...")
-                                insert_user_to_db(c_user)
-                                c_user_id = get_user_id(c_user)
-                                if c_user_id:
-                                    c_id = insert_comment(db_post_id, c_user_id, c_text)
-                                    if c_img_url and c_id:
-                                        insert_comment_photo(c_id, c_img_url)
-
-                        except Exception: continue
-
-                    # Đóng Popup
-                    if is_popup:
-                        webdriver.ActionChains(driver).send_keys(Keys.ESCAPE).perform()
-                        time.sleep(1)
-
-            else:
-                print(f"Skipping seen post.")
-
-        except Exception as e:
-            print(f"Error post {index}: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        index += 1
+    print(f"🎉 DONE crawl_page. Tổng bài lấy được: {crawled_count}")
 
 if __name__ == "__main__":
     crawl_page()
